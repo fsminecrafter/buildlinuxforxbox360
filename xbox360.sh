@@ -5,29 +5,35 @@
 #  Based on: https://free60.org/Linux/Distros/Debian/sid/
 #
 #  Requirements (host machine):
-#    - Docker              (used for the xenon cross-compile toolchain)
-#    - git, wget, curl     (source fetching)
-#    - bc, make, patch     (kernel build helpers, also installed inside Docker)
-#    - xz-utils            (kernel tarball extraction)
+#    - git, wget, curl, xz-utils
+#    - build-essential, flex, bison, libgmp-dev, libmpfr-dev,
+#      libmpc-dev, texinfo, bc, libssl-dev, python3
+#      (xenon toolchain build deps — installed automatically if missing)
 #
 #  What this script does:
-#    1. Checks dependencies
-#    2. Clones the libxenon toolchain (Docker image)
-#    3. Finds and downloads the latest 6.x Linux kernel from kernel.org
-#    4. Clones the Free60 Xbox 360 kernel patch set
-#    5. Applies patches and cross-compiles the kernel (zImage.xenon + .deb pkgs)
-#    6. Clones and builds XeLL Reloaded  -> xell-2f.bin  (JTAG)
-#                                           xell-gggggg.bin (RGH)
-#    7. Clones and builds the XeLL Launch .xex (dashboard launcher)
-#    8. Assembles everything into  ./output/
+#    1. Checks host dependencies
+#    2. Detects or builds the xenon cross-compile toolchain natively
+#       (installs to /usr/local/xenon and adds to PATH — no Docker needed)
+#    3. Detects the latest supported kernel series from the patch repo
+#    4. Downloads and cross-compiles the Linux kernel
+#    5. Clones and builds XeLL Reloaded (all variants)
+#    6. Assembles ALL required HDD files into ./output/ :
+#         updxell.bin    <- XeLL binary ready to flash via filesystem updater
+#         updflash.bin   <- NAND flash updater binary
+#         kboot.conf     <- KBoot configuration template
+#         xenon.elf      <- XeLL ELF (before binary strip)
+#         xenon.z        <- Compressed kernel image (used by kboot)
+#         vmlinux        <- Uncompressed kernel ELF
+#         vmlinux_X.XX.xenon  <- Versioned kernel image (kept for reference)
+#         xell-*.bin     <- All XeLL variant binaries
 #
-#  Run as a normal user (Docker handles root-level cross-compile work).
-#  Do NOT run as root; Docker bind-mounts will be owned by you.
+#  Run as a normal user with sudo available (toolchain build needs root for
+#  /usr/local/xenon install).
 # =============================================================================
 
 set -euo pipefail
 
-# ── Colour helpers ────────────────────────────────────────────────────────────
+# ── Colour helpers ─────────────────────────────────────────────────────────────
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -40,244 +46,352 @@ success() { echo -e "${GREEN}[OK]${NC}    $*"; }
 warn()    { echo -e "${YELLOW}[WARN]${NC}  $*"; }
 die()     { echo -e "${RED}[ERROR]${NC} $*" >&2; exit 1; }
 
-# ── Configuration ─────────────────────────────────────────────────────────────
+# ── Configuration ──────────────────────────────────────────────────────────────
 WORKDIR="$(pwd)/xbox360_build"
 OUTDIR="$(pwd)/output"
-KERNEL_SERIES="6.19"
-DOCKER_IMAGE="free60/libxenon:latest"
-LIBXENON_REPO="https://github.com/Free60Project/libxenon"
+XENON_PREFIX="/usr/local/xenon"
+XENON_BIN="${XENON_PREFIX}/bin"
+TOOLCHAIN_REPO="https://github.com/Free60Project/libxenon"
 PATCH_REPO="https://github.com/Free60Project/linux-kernel-xbox360"
 XELL_REPO="https://github.com/Free60Project/xell-reloaded"
-KERNEL_ORG="https://kernel.org"
+KEEP_BUILD=false   # override with --keep flag
 
-# ── Dependency check ──────────────────────────────────────────────────────────
+KERNEL_SERIES=""
+KERNEL_VERSION=""
+KERNEL_TARBALL=""
+KERNEL_URL=""
+
+# ── Argument parsing ───────────────────────────────────────────────────────────
+for arg in "$@"; do
+    case "$arg" in
+        --keep) KEEP_BUILD=true ;;
+        --help|-h)
+            echo "Usage: $0 [--keep]"
+            echo "  --keep   Keep the xbox360_build/ work directory after a successful build."
+            exit 0 ;;
+        *) die "Unknown argument: ${arg}  (try --help)" ;;
+    esac
+done
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  TOOLCHAIN — detect existing install or build from source
+# ══════════════════════════════════════════════════════════════════════════════
+
+check_toolchain_exists() {
+    # Returns 0 (true) if a working xenon-gcc is already on the system
+    if [[ -x "${XENON_BIN}/xenon-gcc" ]]; then
+        local ver
+        ver=$("${XENON_BIN}/xenon-gcc" --version 2>&1 | head -n1 || true)
+        info "Found existing xenon toolchain: ${ver}"
+        return 0
+    fi
+    # Also check PATH in case it was installed elsewhere
+    if command -v xenon-gcc &>/dev/null; then
+        local ver
+        ver=$(xenon-gcc --version 2>&1 | head -n1 || true)
+        info "Found xenon-gcc in PATH: ${ver}"
+        XENON_BIN="$(dirname "$(command -v xenon-gcc)")"
+        return 0
+    fi
+    return 1
+}
+
+add_toolchain_to_path() {
+    if [[ ":$PATH:" != *":${XENON_BIN}:"* ]]; then
+        export PATH="${XENON_BIN}:${PATH}"
+        info "Added ${XENON_BIN} to PATH for this session."
+    fi
+}
+
+install_toolchain_deps() {
+    info "Installing toolchain build dependencies (requires sudo)..."
+    sudo apt-get update -qq
+    sudo apt-get install -y --no-install-recommends \
+        build-essential flex bison libgmp-dev libmpfr-dev libmpc-dev \
+        texinfo bc libssl-dev python3 wget curl git xz-utils zlib1g-dev \
+        libelf-dev 2>/dev/null || \
+    # RPM-based fallback
+    sudo dnf install -y gcc gcc-c++ make flex bison gmp-devel mpfr-devel \
+        libmpc-devel texinfo bc openssl-devel python3 wget curl git \
+        xz elfutils-libelf-devel 2>/dev/null || \
+    warn "Could not install deps automatically — continuing (may fail if missing)."
+}
+
+build_and_install_toolchain() {
+    info "Xenon toolchain not found. Building from source (this takes 30–90 minutes)..."
+    install_toolchain_deps
+
+    local libxenondir="${WORKDIR}/libxenon-toolchain"
+    git_clone_or_update "$TOOLCHAIN_REPO" "$libxenondir"
+
+    local tcscript
+    tcscript=$(find "$libxenondir" -maxdepth 2 \
+               \( -name "toolchain.sh" -o -name "build-toolchain.sh" \) \
+               2>/dev/null | head -n1 || true)
+    if [[ -z "$tcscript" ]]; then
+        die "Could not locate toolchain.sh inside ${libxenondir}. Check the repo layout."
+    fi
+
+    info "Using toolchain script: ${tcscript}"
+    info "Installing to: ${XENON_PREFIX}"
+
+    # The toolchain script typically reads DEVKITXENON / PREFIX; set both.
+    sudo mkdir -p "$XENON_PREFIX"
+    sudo chown "$USER:$(id -gn)" "$XENON_PREFIX"
+
+    (
+        cd "$(dirname "$tcscript")"
+        export PREFIX="$XENON_PREFIX"
+        export DEVKITXENON="$XENON_PREFIX"
+        bash "$(basename "$tcscript")"
+    )
+
+    if [[ ! -x "${XENON_BIN}/xenon-gcc" ]]; then
+        die "Toolchain build finished but xenon-gcc not found at ${XENON_BIN}. Check build logs."
+    fi
+    success "Xenon toolchain installed to ${XENON_PREFIX}"
+}
+
+setup_toolchain() {
+    echo ""
+    info "═══ Xenon Toolchain ═══════════════════════════════════════"
+    if check_toolchain_exists; then
+        success "Xenon toolchain already installed — skipping build."
+    else
+        build_and_install_toolchain
+    fi
+    add_toolchain_to_path
+    info "Toolchain in PATH: $(command -v xenon-gcc)"
+    echo ""
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  DEPENDENCY CHECK
+# ══════════════════════════════════════════════════════════════════════════════
+
 check_deps() {
     info "Checking host dependencies..."
     local missing=()
-    for cmd in docker git wget curl xz make patch bc; do
+    for cmd in git wget curl xz make patch bc; do
         command -v "$cmd" &>/dev/null || missing+=("$cmd")
     done
     if [[ ${#missing[@]} -gt 0 ]]; then
-        die "Missing required tools: ${missing[*]}\n       Install them and re-run."
+        warn "Missing tools: ${missing[*]} — attempting to install..."
+        sudo apt-get install -y "${missing[@]}" 2>/dev/null || \
+        sudo dnf     install -y "${missing[@]}" 2>/dev/null || \
+        die "Could not install: ${missing[*]}. Please install manually."
     fi
-
-    # Docker daemon running?
-    docker info &>/dev/null || die "Docker daemon is not running. Start it and re-run."
-    success "All dependencies satisfied."
+    success "All host dependencies satisfied."
 }
 
-# ── Resolve the latest 6.x kernel version from kernel.org ─────────────────────
-resolve_kernel_version() {
-    info "Resolving latest ${KERNEL_SERIES}.x kernel from kernel.org..."
-    local releases
-    releases="$(curl -s https://www.kernel.org/releases.json)"
-    # Extract version matching our series using grep+sed (no jq dependency)
-    KERNEL_VERSION=$(echo "$releases" \
-        | grep -oP '"version"\s*:\s*"\K[^"]+' \
-        | grep "^${KERNEL_SERIES}\." \
-        | head -n1)
+# ══════════════════════════════════════════════════════════════════════════════
+#  GIT HELPER
+# ══════════════════════════════════════════════════════════════════════════════
 
-    if [[ -z "$KERNEL_VERSION" ]]; then
-        warn "Could not auto-detect ${KERNEL_SERIES}.x; checking for any 6.x release..."
-        KERNEL_VERSION=$(echo "$releases" \
-            | grep -oP '"version"\s*:\s*"\K[^"]+' \
-            | grep "^6\." \
-            | head -n1)
-        [[ -z "$KERNEL_VERSION" ]] && die "Could not find a suitable 6.x kernel on kernel.org."
-        KERNEL_SERIES=$(echo "$KERNEL_VERSION" | cut -d. -f1-2)
-    fi
-
-    KERNEL_TARBALL="linux-${KERNEL_VERSION}.tar.xz"
-    KERNEL_URL="https://cdn.kernel.org/pub/linux/kernel/v${KERNEL_VERSION%%.*}.x/${KERNEL_TARBALL}"
-    info "Resolved kernel: ${BOLD}${KERNEL_VERSION}${NC}"
-}
-
-# ── Pull / update Docker toolchain image ─────────────────────────────────────
-setup_toolchain() {
-    info "Pulling libxenon Docker image (this may take a while first time)..."
-    docker pull "$DOCKER_IMAGE"
-    success "Docker toolchain ready."
-}
-
-# ── Download and extract kernel sources ───────────────────────────────────────
-download_kernel() {
-    local dest="${WORKDIR}/linux-${KERNEL_VERSION}"
-    if [[ -d "$dest" ]]; then
-        info "Kernel source already present at ${dest}, skipping download."
-        return
-    fi
-
-    info "Downloading Linux ${KERNEL_VERSION}..."
-    mkdir -p "$WORKDIR"
-    wget -q --show-progress -P "$WORKDIR" "$KERNEL_URL" \
-        || die "Failed to download kernel from ${KERNEL_URL}"
-
-    info "Extracting kernel source..."
-    tar -xf "${WORKDIR}/${KERNEL_TARBALL}" -C "$WORKDIR"
-    rm -f "${WORKDIR}/${KERNEL_TARBALL}"
-    success "Kernel source extracted to ${dest}"
-}
-
-# ── Clone or update a git repo ────────────────────────────────────────────────
 git_clone_or_update() {
     local url="$1"
     local dir="$2"
     if [[ -d "${dir}/.git" ]]; then
         info "Updating $(basename "$dir")..."
-        git -C "$dir" pull --ff-only || warn "git pull failed; using existing checkout."
+        git -C "$dir" pull --ff-only 2>/dev/null || \
+            warn "git pull failed; using existing checkout."
     else
         info "Cloning ${url}..."
         git clone --depth 1 "$url" "$dir"
     fi
 }
 
-# ── Clone patch set ───────────────────────────────────────────────────────────
-clone_patches() {
+# ══════════════════════════════════════════════════════════════════════════════
+#  KERNEL — detect supported series, download, patch, build
+# ══════════════════════════════════════════════════════════════════════════════
+
+clone_patches_and_resolve_version() {
+    mkdir -p "$WORKDIR"
     git_clone_or_update "$PATCH_REPO" "${WORKDIR}/linux-kernel-xbox360"
-    success "Xbox 360 kernel patches ready."
+
+    local pdir="${WORKDIR}/linux-kernel-xbox360"
+    local supported=()
+
+    while IFS= read -r pf; do
+        local series
+        series=$(basename "$pf" | grep -oP 'patch-\K[0-9]+\.[0-9]+(?=-xenon)' || true)
+        [[ -z "$series" ]] && continue
+        if ls "${pdir}/xenon-${series}.defconfig"  &>/dev/null 2>&1 || \
+           ls "${pdir}/xenon-${series}-defconfig"   &>/dev/null 2>&1; then
+            supported+=("$series")
+        fi
+    done < <(find "$pdir" -maxdepth 1 -name "patch-*-xenon*.diff")
+
+    if [[ ${#supported[@]} -eq 0 ]]; then
+        info "Patch repo contents:"; ls "$pdir"
+        die "No supported kernel series found in ${pdir}."
+    fi
+
+    KERNEL_SERIES=$(printf '%s\n' "${supported[@]}" \
+        | sort -t. -k1,1n -k2,2n | tail -n1)
+    info "Latest supported kernel series by patch repo: ${BOLD}${KERNEL_SERIES}${NC}"
+
+    info "Resolving latest ${KERNEL_SERIES}.x kernel from kernel.org..."
+    local releases
+    releases="$(curl -s https://www.kernel.org/releases.json)"
+    KERNEL_VERSION=$(echo "$releases" \
+        | grep -oP '"version"\s*:\s*"\K[^"]+' \
+        | grep "^${KERNEL_SERIES}\." \
+        | head -n1)
+
+    if [[ -z "$KERNEL_VERSION" ]]; then
+        warn "Not in releases.json — checking cdn.kernel.org directory listing..."
+        local html
+        html=$(curl -s "https://cdn.kernel.org/pub/linux/kernel/v${KERNEL_SERIES%%.*}.x/")
+        KERNEL_VERSION=$(echo "$html" \
+            | grep -oP "linux-${KERNEL_SERIES//./\\.}\.[0-9]+" \
+            | sort -t. -k3,3n | tail -n1 | sed 's/linux-//')
+    fi
+
+    [[ -z "$KERNEL_VERSION" ]] && KERNEL_VERSION="$KERNEL_SERIES" && \
+        warn "Falling back to base release: ${KERNEL_VERSION}"
+
+    KERNEL_TARBALL="linux-${KERNEL_VERSION}.tar.xz"
+    KERNEL_URL="https://cdn.kernel.org/pub/linux/kernel/v${KERNEL_VERSION%%.*}.x/${KERNEL_TARBALL}"
+    success "Kernel to build: ${BOLD}${KERNEL_VERSION}${NC}  (series ${KERNEL_SERIES})"
 }
 
-# ── Apply patches & cross-compile the kernel (inside Docker) ─────────────────
+download_kernel() {
+    local dest="${WORKDIR}/linux-${KERNEL_VERSION}"
+    if [[ -d "$dest" ]]; then
+        info "Kernel source already present — skipping download."
+        return
+    fi
+    info "Downloading Linux ${KERNEL_VERSION}..."
+    mkdir -p "$WORKDIR"
+    wget -q --show-progress -P "$WORKDIR" "$KERNEL_URL" \
+        || die "Failed to download kernel from ${KERNEL_URL}"
+    info "Extracting kernel source..."
+    tar -xf "${WORKDIR}/${KERNEL_TARBALL}" -C "$WORKDIR"
+    rm -f "${WORKDIR}/${KERNEL_TARBALL}"
+    success "Kernel source extracted to ${dest}"
+}
+
 build_kernel() {
     local kdir="${WORKDIR}/linux-${KERNEL_VERSION}"
     local pdir="${WORKDIR}/linux-kernel-xbox360"
-    local defcfg
+    local defcfg patchfile jobs
 
-    # Locate the defconfig for our kernel series
-    defcfg=$(find "$pdir" -maxdepth 1 -name "xenon-${KERNEL_SERIES}*-defconfig" \
-             | sort -V | tail -n1 || true)
+    if [[ -f "${kdir}/zImage.xenon" && -f "${kdir}/vmlinux" ]]; then
+        info "Kernel already built (zImage.xenon + vmlinux present) — skipping."
+        return
+    fi
+
+    # ── defconfig ──────────────────────────────────────────────────────────
+    defcfg=$(find "$pdir" -maxdepth 1 \
+             \( -name "xenon-${KERNEL_SERIES}.defconfig" \
+             -o -name "xenon-${KERNEL_SERIES}-defconfig" \) \
+             2>/dev/null | head -n1 || true)
     if [[ -z "$defcfg" ]]; then
-        # Fall back to any xenon defconfig available
-        defcfg=$(find "$pdir" -maxdepth 1 -name "xenon-*-defconfig" \
-                 | sort -V | tail -n1 || true)
+        defcfg=$(find "$pdir" -maxdepth 1 \
+                 \( -name "xenon-*.defconfig" -o -name "xenon-*-defconfig" \
+                 -o -name "xenon.defconfig" \) \
+                 2>/dev/null | sort -V | tail -n1 || true)
         [[ -z "$defcfg" ]] && die "No xenon defconfig found in ${pdir}"
         warn "Using fallback defconfig: $(basename "$defcfg")"
     fi
     info "Using defconfig: $(basename "$defcfg")"
 
-    # Find the matching patch file
-    local patchfile
-    patchfile=$(find "$pdir" -maxdepth 1 -name "patch-${KERNEL_SERIES}*-xenon.diff" \
-                | sort -V | tail -n1 || true)
+    # ── patch file ─────────────────────────────────────────────────────────
+    patchfile=$(find "$pdir" -maxdepth 1 \
+                -name "patch-${KERNEL_SERIES}-xenon*.diff" \
+                2>/dev/null | sort -V | tail -n1 || true)
     if [[ -z "$patchfile" ]]; then
-        patchfile=$(find "$pdir" -maxdepth 1 -name "patch-*-xenon.diff" \
-                    | sort -V | tail -n1 || true)
+        patchfile=$(find "$pdir" -maxdepth 1 -name "patch-*-xenon*.diff" \
+                    2>/dev/null | sort -V | tail -n1 || true)
         [[ -z "$patchfile" ]] && die "No xenon patch file found in ${pdir}"
-        warn "Using fallback patch: $(basename "$patchfile")"
+        warn "Using newest available patch: $(basename "$patchfile")"
     fi
     info "Using patch: $(basename "$patchfile")"
 
-    # Copy config
     cp "$defcfg" "${kdir}/.config"
 
-    # Apply patch (idempotent check)
     if [[ ! -f "${kdir}/.xbox360_patched" ]]; then
         info "Applying Xbox 360 kernel patch..."
         patch -d "$kdir" -p1 < "$patchfile"
         touch "${kdir}/.xbox360_patched"
         success "Patch applied."
     else
-        info "Patch already applied, skipping."
+        info "Patch already applied — skipping."
     fi
 
-    # Determine CPU jobs
-    local jobs
     jobs=$(nproc 2>/dev/null || echo 4)
-    info "Building kernel with -j${jobs} inside Docker..."
+    info "Cross-compiling kernel with CROSS_COMPILE=xenon- (-j${jobs})..."
 
-    # Run inside the libxenon Docker container
-    docker run --rm \
-        -v "${WORKDIR}:/work" \
-        "$DOCKER_IMAGE" \
-        bash -c "
-            set -e
-            apt-get install -yq bc >/dev/null 2>&1 || true
-            cd /work/linux-${KERNEL_VERSION}
-            make ARCH=powerpc CROSS_COMPILE=xenon- olddefconfig
-            make -j${jobs} ARCH=powerpc CROSS_COMPILE=xenon- all
-            make -j${jobs} ARCH=powerpc CROSS_COMPILE=xenon- bindeb-pkg || true
-            cp arch/powerpc/boot/zImage.xenon .
-        "
+    (
+        export PATH="${XENON_BIN}:${PATH}"
+        export DEVKITXENON="${XENON_PREFIX}"
+        cd "$kdir"
+        make ARCH=powerpc CROSS_COMPILE=xenon- olddefconfig
+        make -j"${jobs}" ARCH=powerpc CROSS_COMPILE=xenon- all
+        # zImage is the compressed boot image; vmlinux is the ELF
+        cp arch/powerpc/boot/zImage.xenon . 2>/dev/null || \
+        cp arch/powerpc/boot/zImage       ./zImage.xenon 2>/dev/null || \
+        warn "zImage.xenon not found — check arch/powerpc/boot/ output."
+    )
 
     success "Kernel build complete."
-    info "  zImage.xenon  → ${kdir}/zImage.xenon"
 }
 
-# ── Clone and build XeLL Reloaded ─────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+#  XELL — build all variants
+# ══════════════════════════════════════════════════════════════════════════════
+
 build_xell() {
     local xelldir="${WORKDIR}/xell-reloaded"
     git_clone_or_update "$XELL_REPO" "$xelldir"
 
-    info "Building XeLL Reloaded inside Docker..."
-    docker run --rm \
-        -v "${xelldir}:/app" \
-        "$DOCKER_IMAGE" \
-        bash -c "
-            set -e
-            cd /app
-            make clean || true
-            make
-        "
+    # Check if already built
+    if find "$xelldir" -name "*.bin" 2>/dev/null | grep -q .; then
+        info "XeLL binaries already present — skipping rebuild."
+        return
+    fi
+
+    info "Building XeLL Reloaded (all targets)..."
+    (
+        export PATH="${XENON_BIN}:${PATH}"
+        export DEVKITXENON="${XENON_PREFIX}"
+        cd "$xelldir"
+        make clean 2>/dev/null || true
+
+        # Build default (produces xenon.elf, xenon.bin and all variant .bin files)
+        make all 2>/dev/null || make 2>/dev/null || \
+            warn "XeLL 'make all' exited non-zero — checking output anyway."
+    )
 
     success "XeLL build complete."
+    info "XeLL outputs:"
+    find "$xelldir" \( -name "*.bin" -o -name "*.elf" \) \
+        2>/dev/null | sort | sed 's/^/  /'
 }
 
-# ── Build XeLL Launch .xex (libxenon sample launcher) ─────────────────────────
-build_xex_launcher() {
-    # The 'launch' sample in libxenon can load XeLL / other payloads.
-    # xell-reloaded also ships a xenon.xex / launch.xex in some builds.
-    # We build the standard 'launch' example from libxenon.
-    local libxenondir="${WORKDIR}/libxenon"
-    git_clone_or_update "$LIBXENON_REPO" "$libxenondir"
+# ══════════════════════════════════════════════════════════════════════════════
+#  OUTPUT ASSEMBLY
+# ══════════════════════════════════════════════════════════════════════════════
 
-    # Check if a pre-built .xex exists from XeLL build
-    local xex_src
-    xex_src=$(find "${WORKDIR}/xell-reloaded" \
-              -maxdepth 3 -name "*.xex" 2>/dev/null | head -n1 || true)
-
-    if [[ -n "$xex_src" ]]; then
-        info "Found pre-built .xex from XeLL build: $(basename "$xex_src")"
-        cp "$xex_src" "${WORKDIR}/xenon_launch.xex"
-        success "Copied .xex launcher."
-        return
-    fi
-
-    # Build the 'launch' sample from libxenon
-    local launchdir
-    launchdir=$(find "$libxenondir" -type d -name "launch" 2>/dev/null | head -n1 || true)
-    if [[ -z "$launchdir" ]]; then
-        warn "No 'launch' sample found in libxenon; building hello_world .xex instead."
-        launchdir=$(find "$libxenondir" -type d \
-                    \( -name "hello_world" -o -name "helloworld" \) 2>/dev/null | head -n1 || true)
-    fi
-
-    if [[ -z "$launchdir" ]]; then
-        warn "Could not locate a suitable sample to build as .xex. Skipping."
-        return
-    fi
-
-    info "Building .xex from: ${launchdir}..."
-    docker run --rm \
-        -v "${libxenondir}:/libxenon" \
-        "$DOCKER_IMAGE" \
-        bash -c "
-            set -e
-            cd /libxenon/$(realpath --relative-to="$libxenondir" "$launchdir")
-            make clean || true
-            make
-        "
-
-    local built_xex
-    built_xex=$(find "$launchdir" -name "*.xex" 2>/dev/null | head -n1 || true)
-    if [[ -n "$built_xex" ]]; then
-        cp "$built_xex" "${WORKDIR}/xenon_launch.xex"
-        success "Built .xex launcher: $(basename "$built_xex")"
+# Helper: copy file to OUTDIR with a given target name; warn if source missing
+copy_as() {
+    local src="$1"
+    local dst="${OUTDIR}/$2"
+    if [[ -f "$src" ]]; then
+        cp "$src" "$dst"
+        success "  $(basename "$src") → $(basename "$dst")"
     else
-        warn "No .xex produced; dashboard launcher will need to be sourced separately."
+        warn "  Source not found, skipping: ${src}"
     fi
 }
 
-# ── Assemble output directory ─────────────────────────────────────────────────
+# Find the best matching file by glob inside a directory tree
+find_first() {
+    local dir="$1"; shift
+    find "$dir" -maxdepth 4 \( "$@" \) 2>/dev/null | sort -V | head -n1 || true
+}
+
 assemble_output() {
     info "Assembling output directory: ${OUTDIR}"
     mkdir -p "$OUTDIR"
@@ -285,126 +399,222 @@ assemble_output() {
     local kdir="${WORKDIR}/linux-${KERNEL_VERSION}"
     local xelldir="${WORKDIR}/xell-reloaded"
 
-    # ── Kernel
-    if [[ -f "${kdir}/zImage.xenon" ]]; then
-        cp "${kdir}/zImage.xenon" "${OUTDIR}/vmlinux_${KERNEL_VERSION}.xenon"
-        success "Kernel image → ${OUTDIR}/vmlinux_${KERNEL_VERSION}.xenon"
+    echo ""
+    info "── Kernel files ─────────────────────────────────────────────"
+
+    # vmlinux  — uncompressed kernel ELF (required by HDD layout)
+    local vmlinux_elf="${kdir}/vmlinux"
+    copy_as "$vmlinux_elf" "vmlinux"
+
+    # xenon.z  — compressed kernel image (= zImage, used by kboot)
+    local zimage="${kdir}/zImage.xenon"
+    [[ ! -f "$zimage" ]] && zimage="${kdir}/zImage"
+    copy_as "$zimage" "xenon.z"
+
+    # versioned copy for reference
+    if [[ -f "$zimage" ]]; then
+        cp "$zimage" "${OUTDIR}/vmlinux_${KERNEL_VERSION}.xenon"
+        success "  zImage.xenon → vmlinux_${KERNEL_VERSION}.xenon (versioned reference)"
     fi
 
-    # ── .deb packages (kernel + modules)
-    find "$WORKDIR" -maxdepth 2 -name "*.deb" -exec cp {} "$OUTDIR/" \; 2>/dev/null || true
+    echo ""
+    info "── XeLL files ───────────────────────────────────────────────"
 
-    # ── XeLL binaries
-    local xell_bins=()
-    while IFS= read -r -d '' f; do
-        xell_bins+=("$f")
-    done < <(find "$xelldir" -maxdepth 3 -name "*.bin" -print0 2>/dev/null)
+    # xenon.elf — XeLL ELF binary
+    local xell_elf
+    xell_elf=$(find_first "$xelldir" -name "xenon.elf")
+    [[ -z "$xell_elf" ]] && xell_elf=$(find_first "$xelldir" -name "*.elf")
+    copy_as "$xell_elf" "xenon.elf"
 
-    if [[ ${#xell_bins[@]} -gt 0 ]]; then
-        for bin in "${xell_bins[@]}"; do
-            cp "$bin" "$OUTDIR/"
-        done
-        success "XeLL binaries → ${OUTDIR}/"
+    # Copy ALL .bin files with their original names (1f, 2f, gggg variants etc.)
+    local bin_count=0
+    while IFS= read -r -d '' binfile; do
+        cp "$binfile" "${OUTDIR}/"
+        info "  → $(basename "$binfile")"
+        (( bin_count++ )) || true
+    done < <(find "$xelldir" -maxdepth 4 -name "*.bin" -print0 2>/dev/null)
+    [[ $bin_count -eq 0 ]] && warn "No .bin files found in XeLL build output."
+
+    # updxell.bin — XeLL binary used by the dashboard filesystem updater.
+    #   Prefer xell-2f (JTAG) as the default; copy xell-gggg as the RGH variant.
+    #   User can replace as needed.
+    local updxell_src
+    # Try 2f first (JTAG), then gggg (RGH), then any bin
+    updxell_src=$(find_first "$xelldir" -name "xell-2f.bin")
+    [[ -z "$updxell_src" ]] && updxell_src=$(find_first "$xelldir" -name "*2f*.bin")
+    [[ -z "$updxell_src" ]] && updxell_src=$(find_first "$xelldir" -name "xell-gggg*.bin")
+    [[ -z "$updxell_src" ]] && updxell_src=$(find_first "$xelldir" -name "*.bin")
+    if [[ -n "$updxell_src" ]]; then
+        cp "$updxell_src" "${OUTDIR}/updxell.bin"
+        success "  $(basename "$updxell_src") → updxell.bin  (JTAG/2f default)"
+        info "    NOTE: For RGH consoles, replace updxell.bin with xell-gggg*.bin"
     else
-        warn "No .bin files found in XeLL build output."
+        warn "  Could not produce updxell.bin — no .bin found in XeLL output."
     fi
 
-    # ── .xex launcher
-    if [[ -f "${WORKDIR}/xenon_launch.xex" ]]; then
-        cp "${WORKDIR}/xenon_launch.xex" "${OUTDIR}/xenon_launch.xex"
-        success ".xex launcher → ${OUTDIR}/xenon_launch.xex"
+    # updflash.bin — NAND flasher binary.
+    #   xell-reloaded builds this as a separate 'updflash' make target or includes it
+    #   in some build configurations under targets/ or build/.
+    local updflash_src
+    updflash_src=$(find_first "$xelldir" -name "updflash.bin")
+    if [[ -z "$updflash_src" ]]; then
+        # Try to build the updflash target explicitly
+        info "  updflash.bin not found — attempting 'make updflash'..."
+        (
+            export PATH="${XENON_BIN}:${PATH}"
+            export DEVKITXENON="${XENON_PREFIX}"
+            cd "$xelldir"
+            make updflash 2>/dev/null || \
+            make TARGET=updflash 2>/dev/null || true
+        )
+        updflash_src=$(find_first "$xelldir" -name "updflash.bin")
+    fi
+    if [[ -n "$updflash_src" ]]; then
+        copy_as "$updflash_src" "updflash.bin"
+    else
+        # Fall back: updflash is effectively the same NAND-write payload as updxell
+        # for older XeLL builds. Copy updxell as a stand-in and warn the user.
+        warn "  updflash.bin not produced by this XeLL build."
+        if [[ -f "${OUTDIR}/updxell.bin" ]]; then
+            cp "${OUTDIR}/updxell.bin" "${OUTDIR}/updflash.bin"
+            warn "  Copied updxell.bin → updflash.bin as fallback."
+            warn "  If your exploit requires a distinct updflash payload, check"
+            warn "  your XeLL version or source it from your exploit pack."
+        fi
     fi
 
-    # ── kboot.conf template
+    echo ""
+    info "── Config file ──────────────────────────────────────────────"
+
+    # kboot.conf
     cat > "${OUTDIR}/kboot.conf" << 'KBOOT'
 #KBOOTCONFIG
-; Place this file on the FAT32 partition of your USB HDD (partition 1)
-; Place the kernel image (vmlinux_*.xenon renamed to e.g. vmlinux616) here too.
-;
-; --- VIDEO MODE ---
-; videomode=10   ; 10 = HDMI 720p  (see free60.org for full list)
+; Place this file on the FAT/XTAF partition of your USB HDD (partition 1)
+; Place xenon.z (compressed kernel) and any other files here too.
 ;
 ; --- CPU SPEED ---
-speedup=1        ; 1 = XENON_SPEED_FULL
+speedup=1          ; 1 = XENON_SPEED_FULL
 ;
-; --- BOOT TIMEOUT (seconds) ---
+; --- BOOT TIMEOUT (seconds, 0 = wait forever) ---
 timeout=30
 ;
 ; --- BOOT ENTRY ---
-; Adjust 'sdb3' / the root UUID to match your actual USB partition.
+; Adjust 'sdb3' / root UUID to match your actual USB partition.
 ; Run 'blkid' on the Xbox 360 after first boot to find the correct UUID.
 ;
-linux_usb="uda0:/vmlinux616 root=/dev/sdb3 rootfstype=ext4 console=tty0 panic=60 maxcpus=6 coherent_pool=16M rootwait video=xenosfb noplymouth"
+; kernel file:   xenon.z  (compressed image)   OR
+;                vmlinux  (uncompressed ELF)
+;
+linux_usb="uda0:/xenon.z root=/dev/sdb3 rootfstype=ext4 console=tty0 panic=60 maxcpus=6 coherent_pool=16M rootwait video=xenosfb noplymouth"
 KBOOT
+    success "  kboot.conf written."
 
-    success "kboot.conf template written."
+    # .deb kernel packages (if any)
+    find "$WORKDIR" -maxdepth 2 -name "*.deb" \
+        -exec cp {} "$OUTDIR/" \; 2>/dev/null || true
 
-    # ── Summary README
+    # README
     cat > "${OUTDIR}/README.txt" << EOF
 Xbox 360 Linux Build — $(date +%Y-%m-%d)
 Kernel version : ${KERNEL_VERSION}
 Build host     : $(uname -n)
 Based on       : https://free60.org/Linux/Distros/Debian/sid/
 
-FILES
------
-vmlinux_${KERNEL_VERSION}.xenon  — Cross-compiled kernel image
-*.bin                             — XeLL Reloaded bootloader binaries
-xenon_launch.xex                  — XeLL dashboard launcher (.xex)
-kboot.conf                        — KBoot configuration template (edit UUIDs!)
-*.deb                             — Kernel + modules Debian packages (if built)
+HDD FILE LAYOUT (XTAF/FAT partition, partition 1)
+--------------------------------------------------
+  updxell.bin   XeLL flash updater (via dashboard FS update)
+                  Default = xell-2f (JTAG). Replace with xell-gggg* for RGH.
+  updflash.bin  NAND flash write binary
+  kboot.conf    KBoot configuration (edit the root UUID!)
+  xenon.elf     XeLL ELF (reference / for direct ELF loaders)
+  xenon.z       Compressed kernel image  <- kboot loads this by default
+  vmlinux       Uncompressed kernel ELF  <- alternative boot target
 
-INSTALLATION QUICK-STEPS
-------------------------
-1. Partition your USB HDD (MBR):
-     Part 1 : 4 GB   FAT32   <- kboot.conf, kernel, xell.bin go here
-     Part 2 : 8 GB   swap
-     Part 3 : rest   ext4    <- Debian rootfs
+ALSO IN THIS FOLDER
+-------------------
+  vmlinux_${KERNEL_VERSION}.xenon  Versioned kernel image (same as xenon.z)
+  xell-*.bin                       All XeLL variant binaries
+  *.deb                            Debian kernel + module packages (if produced)
 
-2. Flash XeLL to your console:
-     JTAG : rename xell-2f.bin    -> updxell.bin  (or xell.bin)
-     RGH  : rename xell-gggggg.bin -> updxell.bin  (or xell.bin)
-     !! Read the XeLL updxell WARNING on free60.org before using updxell !!
+QUICK-START
+-----------
+1.  Partition USB HDD (MBR):
+      Part 1 :  4 GB   FAT32/XTAF   <- files above go here
+      Part 2 :  8 GB   swap
+      Part 3 :  rest   ext4         <- Debian rootfs
 
-3. Bootstrap Debian ppc64 (Sid) onto the ext4 partition:
-     debootstrap --no-check-sig --arch ppc64 unstable /mnt/deb360 \\
-         http://ftp.debian.ports.org/debian-ports/
+2.  Flash XeLL (choose ONE depending on your exploit):
+      JTAG : use xell-2f.bin    (already copied as updxell.bin)
+      RGH  : use xell-gggg*.bin (copy it over updxell.bin first)
+      !! Read the XeLL updxell WARNING on free60.org before flashing !!
 
-4. Edit kboot.conf with the correct root UUID (blkid on the Xbox).
+3.  Bootstrap Debian ppc64 onto the ext4 partition:
+      debootstrap --no-check-sig --arch ppc64 unstable /mnt/deb360 \\
+          http://ftp.debian.ports.org/debian-ports/
 
-5. Place on FAT32 partition:  kboot.conf, vmlinux_*.xenon (rename as needed)
+4.  Edit kboot.conf — set the correct root device / UUID (use blkid).
 
-6. Boot via XeLL -> select the kboot entry.
+5.  Copy to FAT partition:  kboot.conf  xenon.z  vmlinux  updxell.bin
 
-For full instructions see: https://free60.org/Linux/Distros/Debian/sid/
+6.  Boot via XeLL → select the kboot entry.
+
+Full guide: https://free60.org/Linux/Distros/Debian/sid/
 EOF
 
     echo ""
     echo -e "${BOLD}${GREEN}═══════════════════════════════════════════════════${NC}"
-    echo -e "${BOLD}${GREEN}  Build complete!  Output directory: ${OUTDIR}${NC}"
+    echo -e "${BOLD}${GREEN}  Build complete!  Output: ${OUTDIR}${NC}"
     echo -e "${BOLD}${GREEN}═══════════════════════════════════════════════════${NC}"
     echo ""
+    echo "Required HDD files:"
+    for f in updxell.bin updflash.bin kboot.conf xenon.elf xenon.z vmlinux; do
+        if [[ -f "${OUTDIR}/${f}" ]]; then
+            printf "  ${GREEN}✔${NC}  %-20s  (%s)\n" "$f" "$(du -sh "${OUTDIR}/${f}" | cut -f1)"
+        else
+            printf "  ${RED}✘${NC}  %-20s  MISSING\n" "$f"
+        fi
+    done
+    echo ""
+    echo "All output files:"
     ls -lh "$OUTDIR"
 }
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+#  CLEANUP
+# ══════════════════════════════════════════════════════════════════════════════
+
+cleanup() {
+    if [[ "$KEEP_BUILD" == true ]]; then
+        info "Keeping build directory (--keep): ${WORKDIR}"
+    else
+        info "Removing build directory to free disk space (~15 GB)..."
+        rm -rf "$WORKDIR"
+        success "Build directory removed."
+        info "Tip: pass --keep to preserve sources/objects between runs."
+    fi
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  MAIN
+# ══════════════════════════════════════════════════════════════════════════════
+
 main() {
     echo ""
     echo -e "${BOLD}${CYAN}╔══════════════════════════════════════════════════╗${NC}"
     echo -e "${BOLD}${CYAN}║   Xbox 360 Linux Build Script                   ║${NC}"
-    echo -e "${BOLD}${CYAN}║   Kernel + XeLL + .xex launcher                 ║${NC}"
+    echo -e "${BOLD}${CYAN}║   Kernel + XeLL + updxell/updflash/xenon.z      ║${NC}"
     echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════════════╝${NC}"
     echo ""
+    [[ "$KEEP_BUILD" == true ]] && info "Build directory will be kept (--keep)."
 
     check_deps
-    resolve_kernel_version
-    setup_toolchain
+    setup_toolchain          # ← installs natively, no Docker
+    clone_patches_and_resolve_version
     download_kernel
-    clone_patches
     build_kernel
     build_xell
-    build_xex_launcher
     assemble_output
+    cleanup
 }
 
 main "$@"
