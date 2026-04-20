@@ -339,30 +339,78 @@ build_kernel() {
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  XELL — build all variants
+#  XELL — build all variants + force elf→bin conversion
 # ══════════════════════════════════════════════════════════════════════════════
+
+# Run xenon-objcopy on every .elf in xell-reloaded that has no matching .bin yet.
+# This is the fallback for Makefiles that strip/objcopy inside a sub-target which
+# exits non-zero before copying the result.
+elf_to_bin_all() {
+    local xelldir="$1"
+    local converted=0
+    while IFS= read -r -d '' elf; do
+        local bin="${elf%.elf}.bin"
+        if [[ ! -f "$bin" ]]; then
+            info "  objcopy: $(basename "$elf") → $(basename "$bin")"
+            "${XENON_BIN}/xenon-objcopy" -O binary "$elf" "$bin" 2>/dev/null && \
+                (( converted++ )) || \
+                warn "  objcopy failed for $(basename "$elf")"
+        fi
+    done < <(find "$xelldir" -maxdepth 4 -name "*.elf" -print0 2>/dev/null)
+    [[ $converted -gt 0 ]] && success "  Converted ${converted} elf(s) to bin."
+}
 
 build_xell() {
     local xelldir="${WORKDIR}/xell-reloaded"
     git_clone_or_update "$XELL_REPO" "$xelldir"
 
-    # Check if already built
-    if find "$xelldir" -name "*.bin" 2>/dev/null | grep -q .; then
-        info "XeLL binaries already present — skipping rebuild."
+    export PATH="${XENON_BIN}:${PATH}"
+    export DEVKITXENON="${XENON_PREFIX}"
+
+    # Skip full rebuild only when we already have both .elf AND .bin files
+    local have_elf have_bin
+    have_elf=$(find "$xelldir" -name "*.elf" 2>/dev/null | head -n1 || true)
+    have_bin=$(find "$xelldir" -name "*.bin" 2>/dev/null | head -n1 || true)
+    if [[ -n "$have_elf" && -n "$have_bin" ]]; then
+        info "XeLL already built (elf + bin present) — skipping rebuild."
         return
     fi
 
-    info "Building XeLL Reloaded (all targets)..."
+    info "Building XeLL Reloaded..."
     (
-        export PATH="${XENON_BIN}:${PATH}"
-        export DEVKITXENON="${XENON_PREFIX}"
         cd "$xelldir"
         make clean 2>/dev/null || true
-
-        # Build default (produces xenon.elf, xenon.bin and all variant .bin files)
-        make all 2>/dev/null || make 2>/dev/null || \
-            warn "XeLL 'make all' exited non-zero — checking output anyway."
     )
+
+    # ── Try 'make all' first; on failure fall through to per-target attempts ──
+    info "  Attempting: make all"
+    (
+        cd "$xelldir"
+        make all 2>&1
+    ) && info "  make all succeeded." || warn "  make all exited non-zero — trying individual targets."
+
+    # ── Per-variant targets (each is independent; a failure in one is non-fatal)
+    local variants=(xell-1f xell-2f xell-gggg xell-gggggg updxell updflash)
+    for tgt in "${variants[@]}"; do
+        info "  Attempting: make ${tgt}"
+        (
+            cd "$xelldir"
+            make "$tgt" 2>&1
+        ) && info "  make ${tgt} succeeded." || \
+          warn "  make ${tgt} exited non-zero (may not exist in this version — skipping)."
+    done
+
+    # ── Force-convert every .elf → .bin regardless of Makefile outcome ────────
+    info "Converting all .elf outputs to .bin via xenon-objcopy..."
+    elf_to_bin_all "$xelldir"
+
+    # ── Also try stripping xenon.elf → xenon.bin (generic entry point) ────────
+    local generic_elf
+    generic_elf=$(find "$xelldir" -maxdepth 4 -name "xenon.elf" 2>/dev/null | head -n1 || true)
+    if [[ -n "$generic_elf" && ! -f "${generic_elf%.elf}.bin" ]]; then
+        "${XENON_BIN}/xenon-objcopy" -O binary "$generic_elf" \
+            "${generic_elf%.elf}.bin" 2>/dev/null || true
+    fi
 
     success "XeLL build complete."
     info "XeLL outputs:"
@@ -435,51 +483,71 @@ assemble_output() {
     done < <(find "$xelldir" -maxdepth 4 -name "*.bin" -print0 2>/dev/null)
     [[ $bin_count -eq 0 ]] && warn "No .bin files found in XeLL build output."
 
-    # updxell.bin — XeLL binary used by the dashboard filesystem updater.
-    #   Prefer xell-2f (JTAG) as the default; copy xell-gggg as the RGH variant.
-    #   User can replace as needed.
+    # ── updxell.bin ────────────────────────────────────────────────────────────
+    # Prefer a dedicated updxell.bin, then xell-2f (JTAG), then xell-gggg (RGH),
+    # then any .bin, then last-resort objcopy from the best available .elf.
     local updxell_src
-    # Try 2f first (JTAG), then gggg (RGH), then any bin
-    updxell_src=$(find_first "$xelldir" -name "xell-2f.bin")
+    updxell_src=$(find_first "$xelldir" -name "updxell.bin")
+    [[ -z "$updxell_src" ]] && updxell_src=$(find_first "$xelldir" -name "xell-2f.bin")
     [[ -z "$updxell_src" ]] && updxell_src=$(find_first "$xelldir" -name "*2f*.bin")
     [[ -z "$updxell_src" ]] && updxell_src=$(find_first "$xelldir" -name "xell-gggg*.bin")
     [[ -z "$updxell_src" ]] && updxell_src=$(find_first "$xelldir" -name "*.bin")
-    if [[ -n "$updxell_src" ]]; then
-        cp "$updxell_src" "${OUTDIR}/updxell.bin"
-        success "  $(basename "$updxell_src") → updxell.bin  (JTAG/2f default)"
-        info "    NOTE: For RGH consoles, replace updxell.bin with xell-gggg*.bin"
-    else
-        warn "  Could not produce updxell.bin — no .bin found in XeLL output."
+
+    if [[ -z "$updxell_src" ]]; then
+        # Last resort: objcopy the best elf we have
+        info "  No .bin found — running xenon-objcopy on best available .elf for updxell.bin..."
+        local best_elf
+        best_elf=$(find_first "$xelldir" -name "xell-2f.elf")
+        [[ -z "$best_elf" ]] && best_elf=$(find_first "$xelldir" -name "xell-*.elf")
+        [[ -z "$best_elf" ]] && best_elf=$(find_first "$xelldir" -name "*.elf")
+        if [[ -n "$best_elf" ]]; then
+            "${XENON_BIN}/xenon-objcopy" -O binary "$best_elf" \
+                "${xelldir}/updxell_generated.bin" 2>/dev/null && \
+                updxell_src="${xelldir}/updxell_generated.bin" || \
+                warn "  xenon-objcopy also failed for updxell.bin."
+        fi
     fi
 
-    # updflash.bin — NAND flasher binary.
-    #   xell-reloaded builds this as a separate 'updflash' make target or includes it
-    #   in some build configurations under targets/ or build/.
+    if [[ -n "$updxell_src" ]]; then
+        cp "$updxell_src" "${OUTDIR}/updxell.bin"
+        success "  $(basename "$updxell_src") → updxell.bin"
+        info "    JTAG default (2f). For RGH replace with xell-gggg*.bin"
+    else
+        warn "  updxell.bin could not be produced — no .bin or .elf available."
+    fi
+
+    # ── updflash.bin ───────────────────────────────────────────────────────────
+    # Dedicated NAND flash-write binary. Try Makefile target, then objcopy fallback.
     local updflash_src
     updflash_src=$(find_first "$xelldir" -name "updflash.bin")
+
     if [[ -z "$updflash_src" ]]; then
-        # Try to build the updflash target explicitly
         info "  updflash.bin not found — attempting 'make updflash'..."
         (
             export PATH="${XENON_BIN}:${PATH}"
             export DEVKITXENON="${XENON_PREFIX}"
             cd "$xelldir"
-            make updflash 2>/dev/null || \
-            make TARGET=updflash 2>/dev/null || true
+            make updflash 2>/dev/null || make TARGET=updflash 2>/dev/null || true
         )
+        # Run objcopy on any updflash.elf the make may have produced
+        local uelf
+        uelf=$(find_first "$xelldir" -name "updflash.elf")
+        if [[ -n "$uelf" && ! -f "${uelf%.elf}.bin" ]]; then
+            "${XENON_BIN}/xenon-objcopy" -O binary "$uelf" \
+                "${uelf%.elf}.bin" 2>/dev/null || true
+        fi
         updflash_src=$(find_first "$xelldir" -name "updflash.bin")
     fi
+
     if [[ -n "$updflash_src" ]]; then
         copy_as "$updflash_src" "updflash.bin"
     else
-        # Fall back: updflash is effectively the same NAND-write payload as updxell
-        # for older XeLL builds. Copy updxell as a stand-in and warn the user.
-        warn "  updflash.bin not produced by this XeLL build."
+        warn "  updflash.bin not produced — falling back to copy of updxell.bin."
         if [[ -f "${OUTDIR}/updxell.bin" ]]; then
             cp "${OUTDIR}/updxell.bin" "${OUTDIR}/updflash.bin"
-            warn "  Copied updxell.bin → updflash.bin as fallback."
-            warn "  If your exploit requires a distinct updflash payload, check"
-            warn "  your XeLL version or source it from your exploit pack."
+            warn "  updxell.bin → updflash.bin (fallback copy)."
+            warn "  If your exploit needs a distinct NAND flasher, source updflash"
+            warn "  from your specific exploit pack (Xecuter, etc.)."
         fi
     fi
 
