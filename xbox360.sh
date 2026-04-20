@@ -43,7 +43,7 @@ die()     { echo -e "${RED}[ERROR]${NC} $*" >&2; exit 1; }
 # ── Configuration ─────────────────────────────────────────────────────────────
 WORKDIR="$(pwd)/xbox360_build"
 OUTDIR="$(pwd)/output"
-KERNEL_SERIES="6.16"          # Change to e.g. 6.12 if 6.16 is not yet released
+KERNEL_SERIES="6.19"
 DOCKER_IMAGE="free60/libxenon:latest"
 LIBXENON_REPO="https://github.com/Free60Project/libxenon"
 PATCH_REPO="https://github.com/Free60Project/linux-kernel-xbox360"
